@@ -1,20 +1,17 @@
 import {
   ArrowUpRight,
-  CalendarDays,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   CircleAlert,
-  Clock3,
   FastForward,
   Headphones,
-  ListFilter,
-  LoaderCircle,
   Moon,
   Pause,
   Play,
   RotateCcw,
   Search,
-  SlidersHorizontal,
   Sun,
   Volume2,
   X,
@@ -82,7 +79,7 @@ type DateFilter = 'any' | 'year' | '2020s' | '2010s' | 'early';
 type SortOrder = 'date desc' | 'date asc';
 
 const API_URL = 'https://fdpodcasts.com/api/v2/podcasts/';
-const PAGE_SIZE = 48;
+const PAGE_SIZE = 12;
 
 const FORMAT_OPTIONS = [
   { key: 'solo', label: 'Solo', count: 68 },
@@ -205,13 +202,11 @@ export default function App() {
   const [dateFilter, setDateFilter] = createSignal<DateFilter>('any');
   const [sortOrder, setSortOrder] = createSignal<SortOrder>('date desc');
   const [topicSearch, setTopicSearch] = createSignal('');
-  const [topicMenuOpen, setTopicMenuOpen] = createSignal(false);
   const [popularTopics, setPopularTopics] = createSignal<PopularTag[]>(FALLBACK_TOPICS);
   const [episodes, setEpisodes] = createSignal<Podcast[]>([]);
   const [estimatedTotal, setEstimatedTotal] = createSignal(6386);
   const [page, setPage] = createSignal(0);
   const [loading, setLoading] = createSignal(true);
-  const [loadingMore, setLoadingMore] = createSignal(false);
   const [error, setError] = createSignal('');
   const [selectedEpisode, setSelectedEpisode] = createSignal<Podcast>();
   const [currentEpisode, setCurrentEpisode] = createSignal<Podcast>();
@@ -261,79 +256,64 @@ export default function App() {
       Number(Boolean(query().trim())),
   );
 
-  const canLoadMore = createMemo(
-    () => episodes().length < estimatedTotal() && !loading() && !loadingMore(),
-  );
+  const totalPages = createMemo(() => Math.max(1, Math.ceil(estimatedTotal() / PAGE_SIZE)));
 
-  const loadEpisodes = async (nextPage: number, append: boolean) => {
+  const paginationItems = createMemo<Array<number | 'ellipsis'>>(() => {
+    const last = totalPages();
+    const current = page() + 1;
+    const candidates = new Set([1, last, current - 2, current - 1, current, current + 1, current + 2]);
+    const pages = [...candidates].filter((value) => value >= 1 && value <= last).sort((a, b) => a - b);
+    const items: Array<number | 'ellipsis'> = [];
+    pages.forEach((value, index) => {
+      if (index && value - pages[index - 1] > 1) items.push('ellipsis');
+      items.push(value);
+    });
+    return items;
+  });
+
+  const loadEpisodes = async (nextPage: number) => {
     const serial = ++requestSerial;
-    append ? setLoadingMore(true) : setLoading(true);
+    setLoading(true);
     setError('');
     const formats = selectedFormats();
     const topics = selectedTopics();
-    const baseTags: Array<string | undefined> = topics.length
-      ? [topics[0]]
-      : formats.length
-        ? formats
-        : [undefined];
+    const baseTag = topics[0] ?? formats[0];
 
     try {
-      const responses = await Promise.all(
-        baseTags.map(async (tag) => {
-          const params = new URLSearchParams({
-            includeTagNames: 'true',
-            sort: sortOrder(),
-            pageNumber: String(nextPage),
-            pageSize: String(PAGE_SIZE),
-          });
-          const search = debouncedQuery().trim();
-          if (/^\d+(?:\.\d+)?$/.test(search)) params.set('findWithPage', search);
-          else if (search) params.set('search', search);
-          if (tag) params.set('tag', tag);
-          const response = await fetch(`${API_URL}?${params}`);
-          if (response.status === 404) {
-            return {
-              podcasts: [],
-              totalPodcasts: 0,
-              pageNumber: nextPage,
-              pageSize: PAGE_SIZE,
-            } as PodcastResponse;
-          }
-          if (!response.ok) throw new Error(`The archive returned ${response.status}.`);
-          return response.json() as Promise<PodcastResponse>;
-        }),
-      );
+      const params = new URLSearchParams({
+        includeTagNames: 'true',
+        sort: sortOrder(),
+        pageNumber: String(nextPage),
+        pageSize: String(PAGE_SIZE),
+      });
+      const search = debouncedQuery().trim();
+      if (/^\d+(?:\.\d+)?$/.test(search)) params.set('findWithPage', search);
+      else if (search) params.set('search', search);
+      if (baseTag) params.set('tag', baseTag);
+
+      const apiResponse = await fetch(`${API_URL}?${params}`);
+      const response: PodcastResponse = apiResponse.status === 404
+        ? { podcasts: [], totalPodcasts: 0, pageNumber: nextPage, pageSize: PAGE_SIZE }
+        : await apiResponse.json();
+      if (!apiResponse.ok && apiResponse.status !== 404) {
+        throw new Error(`The archive returned ${apiResponse.status}.`);
+      }
 
       if (serial !== requestSerial) return;
-      const merged = new Map<string, Podcast>();
-      for (const response of responses) {
-        for (const episode of response.podcasts ?? []) merged.set(episode.id, episode);
-      }
-      const nextEpisodes = [...merged.values()].sort((a, b) =>
+      const nextEpisodes = [...(response.podcasts ?? [])].sort((a, b) =>
         sortOrder() === 'date desc'
           ? new Date(b.date).getTime() - new Date(a.date).getTime()
           : new Date(a.date).getTime() - new Date(b.date).getTime(),
       );
-      const totals = responses.reduce((sum, response) => sum + (response.totalPodcasts ?? 0), 0);
-      setEstimatedTotal(totals);
-      setEpisodes((previous) => {
-        if (!append) return nextEpisodes;
-        const combined = new Map(previous.map((episode) => [episode.id, episode]));
-        nextEpisodes.forEach((episode) => combined.set(episode.id, episode));
-        return [...combined.values()].sort((a, b) =>
-          sortOrder() === 'date desc'
-            ? new Date(b.date).getTime() - new Date(a.date).getTime()
-            : new Date(a.date).getTime() - new Date(b.date).getTime(),
-        );
-      });
+      setEstimatedTotal(response.totalPodcasts ?? 0);
+      setEpisodes(nextEpisodes);
     } catch (caught) {
       if (serial !== requestSerial) return;
       setError(caught instanceof Error ? caught.message : 'The archive could not be reached.');
-      if (!append) setEpisodes([]);
+      setEpisodes([]);
     } finally {
       if (serial === requestSerial) {
         setLoading(false);
-        setLoadingMore(false);
       }
     }
   };
@@ -345,10 +325,10 @@ export default function App() {
 
   createEffect(
     on(
-      [debouncedQuery, selectedFormats, selectedTopics, sortOrder],
+      [debouncedQuery, selectedFormats, selectedTopics, durationFilter, dateFilter, sortOrder],
       () => {
         setPage(0);
-        void loadEpisodes(0, false);
+        void loadEpisodes(0);
       },
       { defer: false },
     ),
@@ -376,7 +356,6 @@ export default function App() {
       }
       if (event.key === 'Escape') {
         setSelectedEpisode(undefined);
-        setTopicMenuOpen(false);
       }
     };
     window.addEventListener('keydown', handleKeys);
@@ -399,7 +378,7 @@ export default function App() {
     document.documentElement.dataset.theme = nextTheme;
     document.querySelector('meta[name="theme-color"]')?.setAttribute(
       'content',
-      nextTheme === 'dark' ? '#121513' : '#f6f2e9',
+      nextTheme === 'dark' ? '#0b1218' : '#f2f6f9',
     );
     localStorage.setItem('fdr-theme', nextTheme);
   };
@@ -422,11 +401,11 @@ export default function App() {
     setDurationFilter('any');
     setDateFilter('any');
     setTopicSearch('');
-    setTopicMenuOpen(false);
   };
 
   const beginPlayback = (episode: Podcast, startAt = 0) => {
     if (!episode.urls.audio) return;
+    setSelectedEpisode(undefined);
     const isNew = currentEpisode()?.id !== episode.id;
     setCurrentEpisode(episode);
     queueMicrotask(() => {
@@ -461,10 +440,12 @@ export default function App() {
     audioRef.playbackRate = next;
   };
 
-  const loadNextPage = () => {
-    const next = page() + 1;
-    setPage(next);
-    void loadEpisodes(next, true);
+  const goToPage = (nextPage: number) => {
+    const bounded = Math.max(0, Math.min(totalPages() - 1, nextPage));
+    if (bounded === page() && episodes().length) return;
+    setPage(bounded);
+    void loadEpisodes(bounded);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
   return (
@@ -489,247 +470,173 @@ export default function App() {
             <small>Archive</small>
           </span>
         </a>
-
-        <label class="search-box">
-          <Search size={18} aria-hidden="true" />
-          <input
-            ref={searchInput}
-            aria-label="Search the archive"
-            placeholder="Search ideas, people, or episode numbers"
-            value={query()}
-            onInput={(event) => setQuery(event.currentTarget.value)}
-          />
-          <Show when={query()}>
-            <button class="search-clear" type="button" onClick={() => setQuery('')} aria-label="Clear search">
-              <X size={15} />
-            </button>
-          </Show>
-          <kbd>/</kbd>
-        </label>
-
         <button
-          class="icon-button"
+          class="theme-toggle"
           type="button"
           onClick={() => applyTheme(theme() === 'dark' ? 'light' : 'dark')}
           aria-label={`Use ${theme() === 'dark' ? 'light' : 'dark'} theme`}
         >
-          {theme() === 'dark' ? <Sun size={19} /> : <Moon size={19} />}
+          {theme() === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
+          <span>{theme() === 'dark' ? 'Light' : 'Dark'}</span>
         </button>
       </header>
 
-      <main id="top">
-        <section class="filters" aria-label="Podcast filters">
-          <div class="filter-heading">
-            <span>
-              <ListFilter size={16} /> Refine the archive
-              <Show when={activeFilterCount()}>
-                <b>{activeFilterCount()}</b>
-              </Show>
-            </span>
-            <button type="button" disabled={!activeFilterCount()} onClick={clearFilters}>Clear all</button>
-          </div>
+      <main class="dashboard" id="top">
+        <aside class="filter-sidebar" aria-label="Podcast filters">
+          <form
+            class="sidebar-search"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const nextQuery = query().trim();
+              if (nextQuery === debouncedQuery()) goToPage(0);
+              else setDebouncedQuery(nextQuery);
+            }}
+          >
+            <input
+              ref={searchInput}
+              aria-label="Search the archive"
+              placeholder="Search episodes"
+              value={query()}
+              onInput={(event) => setQuery(event.currentTarget.value)}
+            />
+            <Show when={query()}>
+              <button class="search-clear" type="button" onClick={() => setQuery('')} aria-label="Clear search"><X size={14} /></button>
+            </Show>
+            <button class="search-submit" type="submit" aria-label="Search"><Search size={15} /></button>
+          </form>
 
-          <div class="format-filter-row">
-            <button
-              class="filter-pill"
-              classList={{ active: selectedFormats().length === 0 }}
-              type="button"
-              onClick={() => setSelectedFormats([])}
-            >
-              All formats
+          <div class="filter-section">
+            <span class="filter-label">Format</span>
+            <button class="filter-option" classList={{ active: selectedFormats().length === 0 }} type="button" onClick={() => setSelectedFormats([])}>
+              <span>All episodes</span>
+              <small>6.4k</small>
             </button>
             <For each={FORMAT_OPTIONS}>{(format) => (
               <button
-                class="filter-pill"
+                class="filter-option"
                 classList={{ active: selectedFormats().includes(format.key) }}
                 type="button"
-                aria-pressed={selectedFormats().includes(format.key)}
-                onClick={() => toggleValue(setSelectedFormats, format.key)}
+                onClick={() => setSelectedFormats(selectedFormats().includes(format.key) ? [] : [format.key])}
               >
-                <Show when={selectedFormats().includes(format.key)}><Check size={14} /></Show>
-                {format.label}
+                <span>{format.label}</span>
                 <small>{compactNumber.format(format.count)}</small>
               </button>
             )}</For>
           </div>
 
-          <div class="advanced-filter-row">
-            <div class="topic-menu-wrap">
-              <button
-                class="filter-menu"
-                classList={{ active: selectedTopics().length > 0 }}
-                type="button"
-                aria-expanded={topicMenuOpen()}
-                aria-haspopup="dialog"
-                onClick={() => setTopicMenuOpen(!topicMenuOpen())}
-              >
-                <SlidersHorizontal size={15} />
-                Topics
-                <Show when={selectedTopics().length}><b>{selectedTopics().length}</b></Show>
-                <ChevronDown size={15} />
-              </button>
-
-              <Show when={topicMenuOpen()}>
-                <div class="topic-popover" role="dialog" aria-label="Choose topics">
-                  <div class="topic-popover-head">
-                    <strong>Topics</strong>
-                    <button type="button" onClick={() => setTopicMenuOpen(false)} aria-label="Close topics">
-                      <X size={17} />
-                    </button>
-                  </div>
-                  <label class="topic-search">
-                    <Search size={15} />
-                    <input
-                      placeholder="Find a topic"
-                      value={topicSearch()}
-                      onInput={(event) => setTopicSearch(event.currentTarget.value)}
-                    />
-                  </label>
-                  <div class="topic-options">
-                    <For each={filteredTopics()}>{(topic) => (
-                      <button
-                        type="button"
-                        classList={{ selected: selectedTopics().includes(topic.tagName) }}
-                        onClick={() => toggleValue(setSelectedTopics, topic.tagName)}
-                      >
-                        <span class="topic-check">
-                          <Show when={selectedTopics().includes(topic.tagName)}><Check size={13} /></Show>
-                        </span>
-                        <span>{topic.searchName}</span>
-                        <small>{compactNumber.format(topic.podcastCount)}</small>
-                      </button>
-                    )}</For>
-                  </div>
-                  <Show when={selectedTopics().length}>
-                    <button class="topic-done" type="button" onClick={() => setTopicMenuOpen(false)}>
-                      Show matching episodes
-                    </button>
-                  </Show>
-                </div>
-              </Show>
+          <div class="filter-section topic-section">
+            <span class="filter-label">Topics</span>
+            <label class="topic-filter-input">
+              <Search size={13} />
+              <input placeholder="Filter topics" value={topicSearch()} onInput={(event) => setTopicSearch(event.currentTarget.value)} />
+            </label>
+            <div class="sidebar-topics">
+              <For each={filteredTopics()}>{(topic) => (
+                <button
+                  type="button"
+                  classList={{ active: selectedTopics().includes(topic.tagName) }}
+                  onClick={() => toggleValue(setSelectedTopics, topic.tagName)}
+                >
+                  <span class="topic-check"><Show when={selectedTopics().includes(topic.tagName)}><Check size={11} /></Show></span>
+                  <span>{topic.searchName}</span>
+                  <small>{compactNumber.format(topic.podcastCount)}</small>
+                </button>
+              )}</For>
             </div>
+          </div>
 
-            <label class="select-filter">
-              <Clock3 size={15} />
-              <select
-                aria-label="Filter by duration"
-                value={durationFilter()}
-                onInput={(event) => setDurationFilter(event.currentTarget.value as DurationFilter)}
-              >
-                <option value="any">Any duration</option>
-                <option value="short">Under 30 minutes</option>
-                <option value="medium">30—60 minutes</option>
+          <div class="filter-section select-section">
+            <label>
+              <span>Duration</span>
+              <select value={durationFilter()} onInput={(event) => setDurationFilter(event.currentTarget.value as DurationFilter)}>
+                <option value="any">Any</option>
+                <option value="short">Under 30 min</option>
+                <option value="medium">30—60 min</option>
                 <option value="long">1—2 hours</option>
                 <option value="epic">Over 2 hours</option>
               </select>
-              <ChevronDown size={15} />
             </label>
-
-            <label class="select-filter">
-              <CalendarDays size={15} />
-              <select
-                aria-label="Filter by date"
-                value={dateFilter()}
-                onInput={(event) => setDateFilter(event.currentTarget.value as DateFilter)}
-              >
-                <option value="any">Any date</option>
+            <label>
+              <span>Date</span>
+              <select value={dateFilter()} onInput={(event) => setDateFilter(event.currentTarget.value as DateFilter)}>
+                <option value="any">Any</option>
                 <option value="year">Past year</option>
                 <option value="2020s">2020s</option>
                 <option value="2010s">2010s</option>
                 <option value="early">Before 2010</option>
               </select>
-              <ChevronDown size={15} />
-            </label>
-
-            <label class="select-filter sort-filter">
-              <select
-                aria-label="Sort episodes"
-                value={sortOrder()}
-                onInput={(event) => setSortOrder(event.currentTarget.value as SortOrder)}
-              >
-                <option value="date desc">Newest first</option>
-                <option value="date asc">Oldest first</option>
-              </select>
-              <ChevronDown size={15} />
             </label>
           </div>
 
-          <Show when={selectedTopics().length}>
-            <div class="selected-topics" aria-label="Selected topics">
-              <For each={selectedTopics()}>{(topic) => (
-                <button type="button" onClick={() => toggleValue(setSelectedTopics, topic)}>
-                  {popularTopics().find((item) => item.tagName === topic)?.searchName ?? topic}
-                  <X size={13} />
-                </button>
-              )}</For>
-            </div>
-          </Show>
-        </section>
+          <button class="clear-filters" type="button" disabled={!activeFilterCount()} onClick={clearFilters}>
+            Clear filters <Show when={activeFilterCount()}><span>{activeFilterCount()}</span></Show>
+          </button>
+        </aside>
 
-        <section class="episode-section" aria-busy={loading()}>
-          <div class="section-heading">
+        <section class="content-panel" aria-busy={loading()}>
+          <div class="content-toolbar">
             <div>
-              <h2>{debouncedQuery() ? `Results for “${debouncedQuery()}”` : 'Explore episodes'}</h2>
-              <span>
-                <Show when={!loading()} fallback="Searching the archive…">
-                  {visibleEpisodes().length} shown · {estimatedTotal().toLocaleString()} in this collection
-                </Show>
-              </span>
+              <h1>{debouncedQuery() ? `Results for “${debouncedQuery()}”` : 'Episodes'}</h1>
+              <span>{estimatedTotal().toLocaleString()}</span>
             </div>
-            <span class="api-note"><i /> Live archive</span>
+            <label class="sort-control">
+              <select value={sortOrder()} onInput={(event) => setSortOrder(event.currentTarget.value as SortOrder)}>
+                <option value="date desc">Newest</option>
+                <option value="date asc">Oldest</option>
+              </select>
+              <ChevronDown size={14} />
+            </label>
           </div>
 
           <Show when={loading()}>
             <div class="loading-list" aria-label="Loading episodes">
-              <For each={[1, 2, 3, 4]}>{() => (
-                <div class="loading-row">
-                  <span /><div><i /><i /><i /></div>
-                </div>
-              )}</For>
+              <For each={Array.from({ length: PAGE_SIZE })}>{() => <div class="loading-row"><i /><i /></div>}</For>
             </div>
           </Show>
 
           <Show when={!loading() && error()}>
             <div class="state-card">
-              <CircleAlert size={25} />
-              <h3>The archive is taking a moment</h3>
-              <p>{error()}</p>
-              <button type="button" onClick={() => void loadEpisodes(0, false)}>Try again</button>
+              <CircleAlert size={22} />
+              <h3>Could not reach the archive</h3>
+              <button type="button" onClick={() => void loadEpisodes(page())}>Retry</button>
             </div>
           </Show>
 
           <Show when={!loading() && !error() && visibleEpisodes().length === 0}>
             <div class="state-card">
-              <Search size={25} />
-              <h3>No episodes match every filter</h3>
-              <p>Remove one topic or broaden the date and duration to keep exploring.</p>
-              <button type="button" onClick={clearFilters}>Reset filters</button>
+              <Search size={22} />
+              <h3>No matching episodes</h3>
+              <button type="button" onClick={clearFilters}>Clear filters</button>
             </div>
           </Show>
 
           <Show when={!loading() && visibleEpisodes().length}>
             <div class="episode-list">
+              <div class="episode-list-head" aria-hidden="true">
+                <span>#</span><span>Episode</span><span>Published</span><span>Length</span><span />
+              </div>
               <For each={visibleEpisodes()}>{(episode) => (
                 <button class="episode-row" type="button" onClick={() => setSelectedEpisode(episode)}>
-                  <span class="episode-number">#{episode.num}</span>
-                  <span class="episode-row-title">
-                    <strong>{episode.title}</strong>
-                    <i>{primaryFormat(episode)}</i>
-                  </span>
+                  <span class="episode-number">{episode.num}</span>
+                  <span class="episode-row-title"><strong>{episode.title}</strong><i>{primaryFormat(episode)}</i></span>
                   <time class="episode-date">{formatDate(episode.date)}</time>
-                  <span class="episode-row-duration"><Clock3 size={13} /> {formatDuration(episode.length)}</span>
-                  <ArrowUpRight class="row-arrow" size={15} />
+                  <span class="episode-row-duration">{formatDuration(episode.length)}</span>
+                  <ChevronRight class="row-arrow" size={15} />
                 </button>
               )}</For>
             </div>
+          </Show>
 
-            <Show when={canLoadMore()}>
-              <button class="load-more" type="button" onClick={loadNextPage} disabled={loadingMore()}>
-                <Show when={loadingMore()} fallback="Load more episodes">
-                  <LoaderCircle size={17} class="spin" /> Loading more
+          <Show when={!loading() && !error() && totalPages() > 1}>
+            <nav class="pagination" aria-label="Episode pages">
+              <button type="button" onClick={() => goToPage(page() - 1)} disabled={page() === 0} aria-label="Previous page"><ChevronLeft size={15} /></button>
+              <For each={paginationItems()}>{(item) => (
+                <Show when={item !== 'ellipsis'} fallback={<span>…</span>}>
+                  <button classList={{ active: item === page() + 1 }} type="button" onClick={() => goToPage(Number(item) - 1)}>{item}</button>
                 </Show>
-              </button>
-            </Show>
+              )}</For>
+              <button type="button" onClick={() => goToPage(page() + 1)} disabled={page() + 1 >= totalPages()} aria-label="Next page"><ChevronRight size={15} /></button>
+            </nav>
           </Show>
         </section>
       </main>
