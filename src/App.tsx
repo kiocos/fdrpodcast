@@ -1,7 +1,6 @@
 import {
   ArrowUpRight,
   Check,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
@@ -396,11 +395,18 @@ export default function App() {
 
   const clearFilters = () => {
     setQuery('');
+    setDebouncedQuery('');
     setSelectedFormats([]);
     setSelectedTopics([]);
     setDurationFilter('any');
     setDateFilter('any');
     setTopicSearch('');
+  };
+
+  const clearSearch = () => {
+    setQuery('');
+    setDebouncedQuery('');
+    searchInput.focus();
   };
 
   const beginPlayback = (episode: Podcast, startAt = 0) => {
@@ -464,11 +470,7 @@ export default function App() {
 
       <header class="topbar">
         <a class="brand" href="#top" aria-label="Freedomain Archive home">
-          <span class="brand-mark"><span /></span>
-          <span>
-            <strong>Freedomain</strong>
-            <small>Archive</small>
-          </span>
+          <img class="brand-logo" src="/freedomain-logo.png" alt="Freedomain" />
         </a>
         <button
           class="theme-toggle"
@@ -483,15 +485,8 @@ export default function App() {
 
       <main class="dashboard" id="top">
         <aside class="filter-sidebar" aria-label="Podcast filters">
-          <form
-            class="sidebar-search"
-            onSubmit={(event) => {
-              event.preventDefault();
-              const nextQuery = query().trim();
-              if (nextQuery === debouncedQuery()) goToPage(0);
-              else setDebouncedQuery(nextQuery);
-            }}
-          >
+          <div class="sidebar-search">
+            <Search class="sidebar-search-icon" size={15} aria-hidden="true" />
             <input
               ref={searchInput}
               aria-label="Search the archive"
@@ -500,10 +495,9 @@ export default function App() {
               onInput={(event) => setQuery(event.currentTarget.value)}
             />
             <Show when={query()}>
-              <button class="search-clear" type="button" onClick={() => setQuery('')} aria-label="Clear search"><X size={14} /></button>
+              <button class="search-clear" type="button" onClick={clearSearch} aria-label="Clear search"><X size={14} /></button>
             </Show>
-            <button class="search-submit" type="submit" aria-label="Search"><Search size={15} /></button>
-          </form>
+          </div>
 
           <div class="filter-section">
             <span class="filter-label">Format</span>
@@ -566,6 +560,13 @@ export default function App() {
                 <option value="early">Before 2010</option>
               </select>
             </label>
+            <label>
+              <span>Sort</span>
+              <select value={sortOrder()} onInput={(event) => setSortOrder(event.currentTarget.value as SortOrder)}>
+                <option value="date desc">Newest</option>
+                <option value="date asc">Oldest</option>
+              </select>
+            </label>
           </div>
 
           <button class="clear-filters" type="button" disabled={!activeFilterCount()} onClick={clearFilters}>
@@ -574,20 +575,6 @@ export default function App() {
         </aside>
 
         <section class="content-panel" aria-busy={loading()}>
-          <div class="content-toolbar">
-            <div>
-              <h1>{debouncedQuery() ? `Results for “${debouncedQuery()}”` : 'Episodes'}</h1>
-              <span>{estimatedTotal().toLocaleString()}</span>
-            </div>
-            <label class="sort-control">
-              <select value={sortOrder()} onInput={(event) => setSortOrder(event.currentTarget.value as SortOrder)}>
-                <option value="date desc">Newest</option>
-                <option value="date asc">Oldest</option>
-              </select>
-              <ChevronDown size={14} />
-            </label>
-          </div>
-
           <Show when={loading()}>
             <div class="loading-list" aria-label="Loading episodes">
               <For each={Array.from({ length: PAGE_SIZE })}>{() => <div class="loading-row"><i /><i /></div>}</For>
