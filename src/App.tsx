@@ -1,16 +1,18 @@
 import {
   ArrowUpRight,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
-  FastForward,
   Headphones,
   Moon,
   Pause,
   Play,
   RotateCcw,
+  RotateCw,
   Search,
+  SlidersHorizontal,
   Sun,
   Volume2,
   X,
@@ -76,9 +78,11 @@ type PopularTag = {
 type DurationFilter = 'any' | 'short' | 'medium' | 'long' | 'epic';
 type DateFilter = 'any' | 'year' | '2020s' | '2010s' | 'early';
 type SortOrder = 'date desc' | 'date asc';
+type DetailExitMode = 'dismiss' | 'player' | null;
 
 const API_URL = 'https://fdpodcasts.com/api/v2/podcasts/';
 const PAGE_SIZE = 12;
+const PLAYBACK_RATES = [0.75, 1, 1.25, 1.5, 1.75, 2];
 
 const FORMAT_OPTIONS = [
   { key: 'solo', label: 'Solo', count: 68 },
@@ -208,15 +212,21 @@ export default function App() {
   const [loading, setLoading] = createSignal(true);
   const [error, setError] = createSignal('');
   const [selectedEpisode, setSelectedEpisode] = createSignal<Podcast>();
+  const [detailExitMode, setDetailExitMode] = createSignal<DetailExitMode>(null);
   const [currentEpisode, setCurrentEpisode] = createSignal<Podcast>();
   const [playing, setPlaying] = createSignal(false);
   const [currentTime, setCurrentTime] = createSignal(0);
   const [audioDuration, setAudioDuration] = createSignal(0);
-  const [volume, setVolume] = createSignal(0.85);
+  const [volume, setVolume] = createSignal(1);
   const [playbackRate, setPlaybackRate] = createSignal(1);
+  const [speedMenuOpen, setSpeedMenuOpen] = createSignal(false);
+  const [mobileFiltersOpen, setMobileFiltersOpen] = createSignal(false);
   let searchInput!: HTMLInputElement;
   let audioRef!: HTMLAudioElement;
+  let speedControlRef!: HTMLDivElement;
   let requestSerial = 0;
+  let detailExitTimer: number | undefined;
+  let episodeClickTimer: number | undefined;
 
   const filteredTopics = createMemo(() => {
     const needle = topicSearch().trim().toLowerCase();
@@ -318,7 +328,8 @@ export default function App() {
   };
 
   createEffect(() => {
-    const timer = window.setTimeout(() => setDebouncedQuery(query().trim()), 350);
+    const nextQuery = query().trim();
+    const timer = window.setTimeout(() => setDebouncedQuery(nextQuery), 350);
     onCleanup(() => window.clearTimeout(timer));
   });
 
@@ -333,6 +344,23 @@ export default function App() {
     ),
   );
 
+  const openDetails = (episode: Podcast) => {
+    if (detailExitTimer) window.clearTimeout(detailExitTimer);
+    setDetailExitMode(null);
+    setSelectedEpisode(episode);
+  };
+
+  const closeDetails = (mode: Exclude<DetailExitMode, null> = 'dismiss') => {
+    if (!selectedEpisode()) return;
+    if (detailExitTimer) window.clearTimeout(detailExitTimer);
+    setDetailExitMode(mode);
+    detailExitTimer = window.setTimeout(() => {
+      setSelectedEpisode(undefined);
+      setDetailExitMode(null);
+      detailExitTimer = undefined;
+    }, mode === 'player' ? 240 : 150);
+  };
+
   onMount(() => {
     const savedTheme = localStorage.getItem('fdr-theme');
     const preferredTheme = window.matchMedia('(prefers-color-scheme: dark)').matches
@@ -340,10 +368,16 @@ export default function App() {
       : 'light';
     applyTheme(savedTheme === 'dark' || savedTheme === 'light' ? savedTheme : preferredTheme);
 
-    const savedVolume = Number(localStorage.getItem('fdr-volume'));
-    if (Number.isFinite(savedVolume) && savedVolume >= 0 && savedVolume <= 1) {
-      setVolume(savedVolume);
-      audioRef.volume = savedVolume;
+    const savedVolume = localStorage.getItem('fdr-volume');
+    if (savedVolume !== null) {
+      const parsedVolume = Number(savedVolume);
+      if (Number.isFinite(parsedVolume) && parsedVolume >= 0 && parsedVolume <= 1) {
+        setVolume(parsedVolume);
+        audioRef.volume = parsedVolume;
+      }
+    } else {
+      setVolume(1);
+      audioRef.volume = 1;
     }
 
     const handleKeys = (event: KeyboardEvent) => {
@@ -354,11 +388,27 @@ export default function App() {
         searchInput.focus();
       }
       if (event.key === 'Escape') {
-        setSelectedEpisode(undefined);
+        setSpeedMenuOpen(false);
+        closeDetails();
+      }
+    };
+    const closeSpeedMenu = (event: PointerEvent) => {
+      if (
+        speedMenuOpen() &&
+        speedControlRef &&
+        !speedControlRef.contains(event.target as Node)
+      ) {
+        setSpeedMenuOpen(false);
       }
     };
     window.addEventListener('keydown', handleKeys);
-    onCleanup(() => window.removeEventListener('keydown', handleKeys));
+    window.addEventListener('pointerdown', closeSpeedMenu);
+    onCleanup(() => {
+      window.removeEventListener('keydown', handleKeys);
+      window.removeEventListener('pointerdown', closeSpeedMenu);
+      if (detailExitTimer) window.clearTimeout(detailExitTimer);
+      if (episodeClickTimer) window.clearTimeout(episodeClickTimer);
+    });
 
     void fetch('https://fdpodcasts.com/api/?method=ListPopularTags')
       .then((response) => response.json())
@@ -377,7 +427,7 @@ export default function App() {
     document.documentElement.dataset.theme = nextTheme;
     document.querySelector('meta[name="theme-color"]')?.setAttribute(
       'content',
-      nextTheme === 'dark' ? '#0b1218' : '#f2f6f9',
+      nextTheme === 'dark' ? '#0d0e0f' : '#f3f3f2',
     );
     localStorage.setItem('fdr-theme', nextTheme);
   };
@@ -411,14 +461,30 @@ export default function App() {
 
   const beginPlayback = (episode: Podcast, startAt = 0) => {
     if (!episode.urls.audio) return;
-    setSelectedEpisode(undefined);
     const isNew = currentEpisode()?.id !== episode.id;
     setCurrentEpisode(episode);
+    closeDetails('player');
     queueMicrotask(() => {
       if (isNew) audioRef.load();
+      audioRef.volume = volume();
+      audioRef.playbackRate = playbackRate();
       audioRef.currentTime = startAt;
       void audioRef.play().catch(() => setPlaying(false));
     });
+  };
+
+  const openEpisodeOnSingleClick = (episode: Podcast) => {
+    if (episodeClickTimer) window.clearTimeout(episodeClickTimer);
+    episodeClickTimer = window.setTimeout(() => {
+      openDetails(episode);
+      episodeClickTimer = undefined;
+    }, 240);
+  };
+
+  const playEpisodeOnDoubleClick = (episode: Podcast) => {
+    if (episodeClickTimer) window.clearTimeout(episodeClickTimer);
+    episodeClickTimer = undefined;
+    beginPlayback(episode);
   };
 
   const togglePlayback = () => {
@@ -439,11 +505,20 @@ export default function App() {
     localStorage.setItem('fdr-volume', String(nextVolume));
   };
 
-  const cycleSpeed = () => {
-    const rates = [1, 1.25, 1.5, 2];
-    const next = rates[(rates.indexOf(playbackRate()) + 1) % rates.length];
-    setPlaybackRate(next);
-    audioRef.playbackRate = next;
+  const choosePlaybackSpeed = (nextRate: number) => {
+    setPlaybackRate(nextRate);
+    audioRef.playbackRate = nextRate;
+    setSpeedMenuOpen(false);
+  };
+
+  const closePlayer = () => {
+    audioRef.pause();
+    setSpeedMenuOpen(false);
+    setPlaying(false);
+    setCurrentTime(0);
+    setAudioDuration(0);
+    setCurrentEpisode(undefined);
+    queueMicrotask(() => audioRef.load());
   };
 
   const goToPage = (nextPage: number) => {
@@ -455,7 +530,7 @@ export default function App() {
   };
 
   return (
-    <div class="app-shell">
+    <div class="app-shell" classList={{ 'has-player': Boolean(currentEpisode()) }}>
       <audio
         ref={audioRef}
         src={currentEpisode()?.urls.audio}
@@ -484,7 +559,25 @@ export default function App() {
       </header>
 
       <main class="dashboard" id="top">
-        <aside class="filter-sidebar" aria-label="Podcast filters">
+        <button
+          class="mobile-filter-toggle"
+          type="button"
+          onClick={() => setMobileFiltersOpen((open) => !open)}
+          aria-expanded={mobileFiltersOpen()}
+          aria-controls="podcast-filters"
+        >
+          <SlidersHorizontal size={15} />
+          <span>Filters</span>
+          <Show when={activeFilterCount()}><small>{activeFilterCount()}</small></Show>
+          <ChevronDown class={mobileFiltersOpen() ? 'filter-chevron open' : 'filter-chevron'} size={15} />
+        </button>
+
+        <aside
+          id="podcast-filters"
+          class="filter-sidebar"
+          classList={{ 'mobile-open': mobileFiltersOpen() }}
+          aria-label="Podcast filters"
+        >
           <div class="sidebar-search">
             <Search class="sidebar-search-icon" size={15} aria-hidden="true" />
             <input
@@ -600,16 +693,38 @@ export default function App() {
           <Show when={!loading() && visibleEpisodes().length}>
             <div class="episode-list">
               <div class="episode-list-head" aria-hidden="true">
-                <span>#</span><span>Episode</span><span>Published</span><span>Length</span><span />
+                <span>#</span><span>Length</span><span>Play</span><span>Episode</span><span>Published</span><span />
               </div>
               <For each={visibleEpisodes()}>{(episode) => (
-                <button class="episode-row" type="button" onClick={() => setSelectedEpisode(episode)}>
+                <div class="episode-row">
+                  <button
+                    class="episode-open"
+                    type="button"
+                    onClick={(event) => {
+                      if (event.detail === 1) openEpisodeOnSingleClick(episode);
+                    }}
+                    onDblClick={() => playEpisodeOnDoubleClick(episode)}
+                    aria-label={`View details for ${episode.title}; double-click to play`}
+                    title="Double-click to play"
+                  />
                   <span class="episode-number">{episode.num}</span>
+                  <span class="episode-row-duration">{formatDuration(episode.length)}</span>
+                  <button
+                    class="episode-quick-play"
+                    type="button"
+                    disabled={!episode.urls.audio}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      beginPlayback(episode);
+                    }}
+                    aria-label={`Play ${episode.title}`}
+                  >
+                    <Play size={12} fill="currentColor" />
+                  </button>
                   <span class="episode-row-title"><strong>{episode.title}</strong><i>{primaryFormat(episode)}</i></span>
                   <time class="episode-date">{formatDate(episode.date)}</time>
-                  <span class="episode-row-duration">{formatDuration(episode.length)}</span>
                   <ChevronRight class="row-arrow" size={15} />
-                </button>
+                </div>
               )}</For>
             </div>
           </Show>
@@ -629,13 +744,20 @@ export default function App() {
       </main>
 
       <Show when={selectedEpisode()} keyed>{(episode) => (
-        <div class="detail-layer" role="presentation">
-          <button class="detail-scrim" type="button" onClick={() => setSelectedEpisode(undefined)} aria-label="Close episode details" />
+        <div
+          class="detail-layer"
+          classList={{
+            dismissing: detailExitMode() === 'dismiss',
+            'to-player': detailExitMode() === 'player',
+          }}
+          role="presentation"
+        >
+          <button class="detail-scrim" type="button" onClick={() => closeDetails()} aria-label="Close episode details" />
           <aside class="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detail-title">
             <div class="detail-toolbar">
               <span>Episode #{episode.num}</span>
-              <button type="button" onClick={() => setSelectedEpisode(undefined)} aria-label="Close details">
-                <X size={20} />
+              <button type="button" onClick={() => closeDetails()} aria-label="Close details">
+                <X size={15} />
               </button>
             </div>
 
@@ -689,7 +811,7 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       if (!FORMAT_TAGS.has(tag.tagName)) toggleValue(setSelectedTopics, tag.tagName);
-                      setSelectedEpisode(undefined);
+                      closeDetails();
                     }}
                   >
                     {tag.searchName ?? tag.tagName}
@@ -711,12 +833,13 @@ export default function App() {
         </div>
       )}</Show>
 
+      <Show when={currentEpisode()}>
       <footer class="player-shell" aria-label="Audio player">
         <button
           class="player-episode"
           type="button"
           disabled={!currentEpisode()}
-          onClick={() => currentEpisode() && setSelectedEpisode(currentEpisode())}
+          onClick={() => currentEpisode() && openDetails(currentEpisode()!)}
         >
           <Show
             when={currentEpisode()?.urls.thumbnail}
@@ -735,18 +858,63 @@ export default function App() {
         </button>
 
         <div class="player-center">
-          <div class="transport-controls">
-            <button type="button" disabled={!currentEpisode()} onClick={() => seekTo(currentTime() - 15)} aria-label="Go back 15 seconds">
-              <RotateCcw size={18} /><small>15</small>
-            </button>
-            <button class="main-play" type="button" disabled={!currentEpisode()} onClick={togglePlayback} aria-label={playing() ? 'Pause' : 'Play'}>
-              <Show when={playing()} fallback={<Play size={20} fill="currentColor" />}>
-                <Pause size={19} fill="currentColor" />
+          <div class="player-controls-row">
+            <div class="speed-control" ref={speedControlRef}>
+              <button
+                class="speed-button"
+                type="button"
+                onClick={() => setSpeedMenuOpen((open) => !open)}
+                aria-label="Choose playback speed"
+                aria-haspopup="menu"
+                aria-expanded={speedMenuOpen()}
+              >
+                {playbackRate()}×
+              </button>
+              <Show when={speedMenuOpen()}>
+                <div class="speed-menu" role="menu" aria-label="Playback speed">
+                  <For each={PLAYBACK_RATES}>{(rate) => (
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={playbackRate() === rate}
+                      classList={{ active: playbackRate() === rate }}
+                      onClick={() => choosePlaybackSpeed(rate)}
+                    >
+                      <span>{rate}×</span>
+                      <Show when={playbackRate() === rate}><Check size={12} /></Show>
+                    </button>
+                  )}</For>
+                </div>
               </Show>
-            </button>
-            <button type="button" disabled={!currentEpisode()} onClick={() => seekTo(currentTime() + 30)} aria-label="Go forward 30 seconds">
-              <FastForward size={18} /><small>30</small>
-            </button>
+            </div>
+
+            <div class="transport-controls">
+              <button class="skip-button" type="button" disabled={!currentEpisode()} onClick={() => seekTo(currentTime() - 15)} aria-label="Go back 15 seconds">
+                <RotateCcw size={21} /><small>15</small>
+              </button>
+              <button class="main-play" type="button" disabled={!currentEpisode()} onClick={togglePlayback} aria-label={playing() ? 'Pause' : 'Play'}>
+                <Show when={playing()} fallback={<Play size={20} fill="currentColor" />}>
+                  <Pause size={19} fill="currentColor" />
+                </Show>
+              </button>
+              <button class="skip-button" type="button" disabled={!currentEpisode()} onClick={() => seekTo(currentTime() + 30)} aria-label="Go forward 30 seconds">
+                <RotateCw size={21} /><small>30</small>
+              </button>
+            </div>
+
+            <div class="volume-control">
+              <Volume2 size={16} />
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={volume()}
+                aria-label="Volume"
+                style={{ '--progress': `${volume() * 100}%` }}
+                onInput={(event) => updateVolume(Number(event.currentTarget.value))}
+              />
+            </div>
           </div>
           <div class="timeline-row">
             <time>{formatClock(currentTime())}</time>
@@ -765,23 +933,11 @@ export default function App() {
           </div>
         </div>
 
-        <div class="player-extras">
-          <button class="speed-button" type="button" onClick={cycleSpeed} aria-label="Change playback speed">
-            {playbackRate()}×
-          </button>
-          <Volume2 size={17} />
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.01"
-            value={volume()}
-            aria-label="Volume"
-            style={{ '--progress': `${volume() * 100}%` }}
-            onInput={(event) => updateVolume(Number(event.currentTarget.value))}
-          />
-        </div>
+        <button class="player-close" type="button" onClick={closePlayer} aria-label="Close player and stop playback">
+          <X size={16} />
+        </button>
       </footer>
+      </Show>
     </div>
   );
 }
