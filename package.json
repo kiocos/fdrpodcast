@@ -12,6 +12,7 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
+    "@vercel/analytics": "^2.0.1",
     "lucide-solid": "^1.38.0",
     "solid-js": "^1.9.15",
     "vite-plugin-solid": "^2.11.14"
