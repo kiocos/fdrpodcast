@@ -78,11 +78,17 @@ type PopularTag = {
 type DurationFilter = 'any' | 'short' | 'medium' | 'long' | 'epic';
 type DateFilter = 'any' | 'year' | '2020s' | '2010s' | 'early';
 type SortOrder = 'date desc' | 'date asc';
-type DetailExitMode = 'dismiss' | 'player' | null;
+type DetailExitMode = 'dismiss' | 'player' | 'sheet' | null;
 
 const API_URL = 'https://fdpodcasts.com/api/v2/podcasts/';
 const PAGE_SIZE = 12;
 const PLAYBACK_RATES = [0.75, 1, 1.25, 1.5, 1.75, 2];
+
+const GitHubMark = () => (
+  <svg viewBox="0 0 16 16" width="17" height="17" fill="currentColor" aria-hidden="true">
+    <path d="M8 0a8 8 0 0 0-2.53 15.59c.4.07.55-.17.55-.38v-1.49c-2.23.49-2.69-.94-2.69-.94-.36-.93-.89-1.18-.89-1.18-.73-.5.06-.49.06-.49.8.06 1.23.83 1.23.83.72 1.22 1.88.87 2.34.66.07-.52.28-.87.51-1.07-1.78-.2-3.65-.89-3.65-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.67 7.67 0 0 1 8 3.86c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.28.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8 8 0 0 0 8 0Z" />
+  </svg>
+);
 
 const FORMAT_OPTIONS = [
   { key: 'solo', label: 'Solo', count: 68 },
@@ -221,12 +227,17 @@ export default function App() {
   const [playbackRate, setPlaybackRate] = createSignal(1);
   const [speedMenuOpen, setSpeedMenuOpen] = createSignal(false);
   const [mobileFiltersOpen, setMobileFiltersOpen] = createSignal(false);
+  const [sheetDragY, setSheetDragY] = createSignal(0);
+  const [sheetDragging, setSheetDragging] = createSignal(false);
   let searchInput!: HTMLInputElement;
   let audioRef!: HTMLAudioElement;
   let speedControlRef!: HTMLDivElement;
   let requestSerial = 0;
   let detailExitTimer: number | undefined;
   let episodeClickTimer: number | undefined;
+  let sheetPointerId: number | undefined;
+  let sheetDragStartY = 0;
+  let sheetDragStartedAt = 0;
 
   const filteredTopics = createMemo(() => {
     const needle = topicSearch().trim().toLowerCase();
@@ -346,7 +357,10 @@ export default function App() {
 
   const openDetails = (episode: Podcast) => {
     if (detailExitTimer) window.clearTimeout(detailExitTimer);
+    setSpeedMenuOpen(false);
     setDetailExitMode(null);
+    setSheetDragY(0);
+    setSheetDragging(false);
     setSelectedEpisode(episode);
   };
 
@@ -357,8 +371,50 @@ export default function App() {
     detailExitTimer = window.setTimeout(() => {
       setSelectedEpisode(undefined);
       setDetailExitMode(null);
+      setSheetDragY(0);
+      setSheetDragging(false);
       detailExitTimer = undefined;
-    }, mode === 'player' ? 240 : 150);
+    }, mode === 'player' || mode === 'sheet' ? 240 : 150);
+  };
+
+  const startSheetDrag = (event: PointerEvent) => {
+    if (
+      !window.matchMedia('(max-width: 700px)').matches ||
+      currentEpisode()?.id !== selectedEpisode()?.id ||
+      detailExitMode()
+    ) return;
+
+    const surface = event.currentTarget as HTMLElement;
+    sheetPointerId = event.pointerId;
+    sheetDragStartY = event.clientY;
+    sheetDragStartedAt = performance.now();
+    setSheetDragging(true);
+    surface.setPointerCapture(event.pointerId);
+  };
+
+  const moveSheetDrag = (event: PointerEvent) => {
+    if (!sheetDragging() || event.pointerId !== sheetPointerId) return;
+    setSheetDragY(Math.max(0, event.clientY - sheetDragStartY));
+  };
+
+  const finishSheetDrag = (event: PointerEvent) => {
+    if (!sheetDragging() || event.pointerId !== sheetPointerId) return;
+    const surface = event.currentTarget as HTMLElement;
+    if (surface.hasPointerCapture(event.pointerId)) {
+      surface.releasePointerCapture(event.pointerId);
+    }
+
+    const distance = sheetDragY();
+    const elapsed = Math.max(1, performance.now() - sheetDragStartedAt);
+    const velocity = distance / elapsed;
+    sheetPointerId = undefined;
+    setSheetDragging(false);
+
+    if (distance >= 110 || (distance >= 42 && velocity > 0.55)) {
+      closeDetails('sheet');
+    } else {
+      setSheetDragY(0);
+    }
   };
 
   onMount(() => {
@@ -389,7 +445,9 @@ export default function App() {
       }
       if (event.key === 'Escape') {
         setSpeedMenuOpen(false);
-        closeDetails();
+        closeDetails(
+          currentEpisode()?.id === selectedEpisode()?.id ? 'sheet' : 'dismiss',
+        );
       }
     };
     const closeSpeedMenu = (event: PointerEvent) => {
@@ -462,8 +520,15 @@ export default function App() {
   const beginPlayback = (episode: Podcast, startAt = 0) => {
     if (!episode.urls.audio) return;
     const isNew = currentEpisode()?.id !== episode.id;
+    const keepDetailsOpen = selectedEpisode()?.id === episode.id;
     setCurrentEpisode(episode);
-    closeDetails('player');
+    if (keepDetailsOpen) {
+      setDetailExitMode(null);
+      setSheetDragY(0);
+      setSheetDragging(false);
+    } else {
+      closeDetails('player');
+    }
     queueMicrotask(() => {
       if (isNew) audioRef.load();
       audioRef.volume = volume();
@@ -544,18 +609,41 @@ export default function App() {
       />
 
       <header class="topbar">
-        <a class="brand" href="#top" aria-label="Freedomain Archive home">
-          <img class="brand-logo" src="/freedomain-logo.png" alt="Freedomain" />
-        </a>
-        <button
-          class="theme-toggle"
-          type="button"
-          onClick={() => applyTheme(theme() === 'dark' ? 'light' : 'dark')}
-          aria-label={`Use ${theme() === 'dark' ? 'light' : 'dark'} theme`}
-        >
-          {theme() === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
-          <span>{theme() === 'dark' ? 'Light' : 'Dark'}</span>
-        </button>
+        <div class="topbar-brand-group">
+          <a class="brand" href="#top" aria-label="FDR Podcasts home">
+            <img class="brand-logo" src="/freedomain-logo.png" alt="Freedomain" />
+          </a>
+        </div>
+
+        <nav class="topbar-actions" aria-label="Application links">
+          <a
+            class="topbar-link official-player-link"
+            href="https://fdpodcasts.com/"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <span>Official player</span>
+            <ArrowUpRight size={15} aria-hidden="true" />
+          </a>
+          <a
+            class="topbar-link github-link"
+            href="https://github.com/kiocos/fdrpodcast"
+            target="_blank"
+            rel="noreferrer"
+            aria-label="View this project on GitHub"
+          >
+            <GitHubMark />
+          </a>
+          <button
+            class="theme-toggle"
+            type="button"
+            onClick={() => applyTheme(theme() === 'dark' ? 'light' : 'dark')}
+            aria-label={`Use ${theme() === 'dark' ? 'light' : 'dark'} theme`}
+          >
+            {theme() === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
+            <span>{theme() === 'dark' ? 'Light' : 'Dark'}</span>
+          </button>
+        </nav>
       </header>
 
       <main class="dashboard" id="top">
@@ -749,17 +837,118 @@ export default function App() {
           classList={{
             dismissing: detailExitMode() === 'dismiss',
             'to-player': detailExitMode() === 'player',
+            'sheet-down': detailExitMode() === 'sheet',
+            'expanded-player':
+              currentEpisode()?.id === episode.id && detailExitMode() !== 'player',
           }}
           role="presentation"
         >
-          <button class="detail-scrim" type="button" onClick={() => closeDetails()} aria-label="Close episode details" />
-          <aside class="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detail-title">
-            <div class="detail-toolbar">
-              <span>Episode #{episode.num}</span>
-              <button type="button" onClick={() => closeDetails()} aria-label="Close details">
-                <X size={15} />
-              </button>
-            </div>
+          <button
+            class="detail-scrim"
+            type="button"
+            onClick={() => closeDetails(currentEpisode()?.id === episode.id ? 'sheet' : 'dismiss')}
+            aria-label={currentEpisode()?.id === episode.id ? 'Collapse player' : 'Close episode details'}
+          />
+          <aside
+            class="detail-panel"
+            classList={{
+              'playing-detail': currentEpisode()?.id === episode.id,
+              'sheet-dragging': sheetDragging(),
+            }}
+            style={{ '--sheet-drag': `${sheetDragY()}px` }}
+            role="dialog"
+            aria-modal="true"
+            aria-label={episode.title}
+          >
+            <button
+              class="detail-floating-close"
+              type="button"
+              onClick={() => closeDetails(currentEpisode()?.id === episode.id ? 'sheet' : 'dismiss')}
+              aria-label={currentEpisode()?.id === episode.id ? 'Collapse player' : 'Close details'}
+            >
+              <X class="detail-close-x" size={16} />
+              <ChevronDown class="detail-close-chevron" size={24} />
+            </button>
+
+            <Show when={currentEpisode()?.id === episode.id}>
+              <section class="now-playing-panel" aria-label="Now playing controls">
+                <div
+                  class="now-playing-drag-surface"
+                  onPointerDown={startSheetDrag}
+                  onPointerMove={moveSheetDrag}
+                  onPointerUp={finishSheetDrag}
+                  onPointerCancel={finishSheetDrag}
+                >
+                  <div class="now-playing-art-wrap">
+                    <Show
+                      when={episode.urls.thumbnail}
+                      fallback={<div class="now-playing-art now-playing-fallback">FDR<br />{episode.num}</div>}
+                    >
+                      <img class="now-playing-art" src={episode.urls.thumbnail} alt={`${episode.title} cover`} />
+                    </Show>
+                  </div>
+
+                  <div class="now-playing-copy">
+                    <div class="now-playing-meta">
+                      <span>{primaryFormat(episode)} · Episode #{episode.num}</span>
+                    </div>
+                    <h2>{episode.title}</h2>
+                  </div>
+                </div>
+
+                <div class="now-playing-timeline">
+                  <input
+                    type="range"
+                    min="0"
+                    max={audioDuration() || 1}
+                    step="1"
+                    value={currentTime()}
+                    aria-label="Episode progress"
+                    style={{ '--progress': `${audioDuration() ? (currentTime() / audioDuration()) * 100 : 0}%` }}
+                    onInput={(event) => seekTo(Number(event.currentTarget.value))}
+                  />
+                  <div><time>{formatClock(currentTime())}</time><time>{formatClock(audioDuration())}</time></div>
+                </div>
+
+                <div class="now-playing-controls-line">
+                  <div class="now-playing-transport">
+                    <select
+                      class="now-playing-speed-control"
+                      value={playbackRate()}
+                      onInput={(event) => choosePlaybackSpeed(Number(event.currentTarget.value))}
+                      aria-label="Playback speed"
+                    >
+                      <For each={PLAYBACK_RATES}>{(rate) => <option value={rate}>{rate}×</option>}</For>
+                    </select>
+                    <button type="button" onClick={() => seekTo(currentTime() - 15)} aria-label="Go back 15 seconds">
+                      <RotateCcw size={25} /><small>15</small>
+                    </button>
+                    <button class="now-playing-main" type="button" onClick={togglePlayback} aria-label={playing() ? 'Pause' : 'Play'}>
+                      <Show when={playing()} fallback={<Play size={27} fill="currentColor" />}>
+                        <Pause size={25} fill="currentColor" />
+                      </Show>
+                    </button>
+                    <button type="button" onClick={() => seekTo(currentTime() + 30)} aria-label="Go forward 30 seconds">
+                      <RotateCw size={25} /><small>30</small>
+                    </button>
+                  </div>
+
+                  <label class="now-playing-volume-control">
+                    <Volume2 size={18} aria-hidden="true" />
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={volume()}
+                      aria-label="Volume"
+                      style={{ '--progress': `${volume() * 100}%` }}
+                      onInput={(event) => updateVolume(Number(event.currentTarget.value))}
+                    />
+                  </label>
+                </div>
+              </section>
+            </Show>
 
             <div class="detail-hero">
               <Show when={episode.urls.thumbnail} fallback={<div class="detail-art-fallback">FDR<br />{episode.num}</div>}>
@@ -771,7 +960,7 @@ export default function App() {
                   <span>{formatDate(episode.date)}</span>
                   <span>{formatDuration(episode.length)}</span>
                 </span>
-                <h2 id="detail-title">{episode.title}</h2>
+                <h2>{episode.title}</h2>
                 <button class="primary-play" type="button" onClick={() => beginPlayback(episode)} disabled={!episode.urls.audio}>
                   <Show when={currentEpisode()?.id === episode.id && playing()} fallback={<Play size={18} fill="currentColor" />}>
                     <Pause size={18} fill="currentColor" />
