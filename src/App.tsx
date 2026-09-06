@@ -12,6 +12,7 @@ import {
   RotateCcw,
   RotateCw,
   Search,
+  Share2,
   SlidersHorizontal,
   Sun,
   Volume2,
@@ -79,10 +80,52 @@ type DurationFilter = 'any' | 'short' | 'medium' | 'long' | 'epic';
 type DateFilter = 'any' | 'year' | '2020s' | '2010s' | 'early';
 type SortOrder = 'date desc' | 'date asc';
 type DetailExitMode = 'dismiss' | 'player' | 'sheet' | null;
+type ShareStatus = 'idle' | 'copied' | 'failed';
+type StoredPlaybackState = {
+  version: 1;
+  episodeNumber: number;
+  position: number;
+  wasPlaying: boolean;
+};
 
 const API_URL = 'https://fdpodcasts.com/api/v2/podcasts/';
 const PAGE_SIZE = 12;
 const PLAYBACK_RATES = [0.75, 1, 1.25, 1.5, 1.75, 2];
+const DEFAULT_DOCUMENT_TITLE = 'FDR Podcasts | Unofficial player';
+const PODCAST_ROUTE_PATTERN = /^\/podcast\/(\d+(?:\.\d+)?)\/?$/;
+const PLAYBACK_STORAGE_KEY = 'fdr-playback-state';
+
+const podcastPath = (episodeNumber: number) => `/podcast/${episodeNumber}`;
+
+const podcastNumberFromPath = (pathname: string) => {
+  const match = pathname.match(PODCAST_ROUTE_PATTERN);
+  if (!match) return undefined;
+  const episodeNumber = Number(match[1]);
+  return Number.isFinite(episodeNumber) ? episodeNumber : undefined;
+};
+
+const readStoredPlayback = (): StoredPlaybackState | undefined => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PLAYBACK_STORAGE_KEY) ?? 'null') as
+      | Partial<StoredPlaybackState>
+      | null;
+    if (
+      parsed?.version !== 1 ||
+      !Number.isFinite(parsed.episodeNumber) ||
+      !Number.isFinite(parsed.position) ||
+      typeof parsed.wasPlaying !== 'boolean'
+    ) return undefined;
+
+    return {
+      version: 1,
+      episodeNumber: Number(parsed.episodeNumber),
+      position: Math.max(0, Number(parsed.position)),
+      wasPlaying: parsed.wasPlaying,
+    };
+  } catch {
+    return undefined;
+  }
+};
 
 const GitHubMark = () => (
   <svg viewBox="0 0 16 16" width="17" height="17" fill="currentColor" aria-hidden="true">
@@ -96,10 +139,11 @@ const FORMAT_OPTIONS = [
   { key: 'call-in-show', label: 'Call-in shows', count: 1339 },
   { key: 'interview', label: 'Interviews', count: 284 },
   { key: 'debate', label: 'Debates', count: 101 },
+  { key: 'other', label: 'Other' },
 ] as const;
 
 const FORMAT_TAGS = new Set([
-  ...FORMAT_OPTIONS.map((item) => item.key),
+  ...FORMAT_OPTIONS.filter((item) => item.key !== 'other').map((item) => item.key),
   'conversation',
   'listener-questions',
   'Q&A',
@@ -159,7 +203,9 @@ const episodeTags = (episode: Podcast) =>
 
 const primaryFormat = (episode: Podcast) => {
   const tags = episodeTags(episode);
-  const direct = FORMAT_OPTIONS.find((option) => tags.includes(option.key));
+  const direct = FORMAT_OPTIONS.find(
+    (option) => option.key !== 'other' && tags.includes(option.key),
+  );
   if (direct) return direct.label.replace(/s$/, '');
   if (tags.includes('listener-questions') || tags.includes('Q&A')) return 'Listener Q&A';
   if (tags.includes('conversation')) return 'Conversation';
@@ -202,6 +248,10 @@ const dateMatches = (date: string, filter: DateFilter) => {
 };
 
 export default function App() {
+  const navigationEntry = performance.getEntriesByType('navigation')[0] as
+    | PerformanceNavigationTiming
+    | undefined;
+  const pageWasReloaded = navigationEntry?.type === 'reload';
   const [theme, setTheme] = createSignal<'light' | 'dark'>('light');
   const [query, setQuery] = createSignal('');
   const [debouncedQuery, setDebouncedQuery] = createSignal('');
@@ -229,12 +279,18 @@ export default function App() {
   const [mobileFiltersOpen, setMobileFiltersOpen] = createSignal(false);
   const [sheetDragY, setSheetDragY] = createSignal(0);
   const [sheetDragging, setSheetDragging] = createSignal(false);
+  const [shareStatus, setShareStatus] = createSignal<ShareStatus>('idle');
   let searchInput!: HTMLInputElement;
   let audioRef!: HTMLAudioElement;
   let speedControlRef!: HTMLDivElement;
   let requestSerial = 0;
+  let routeRequestSerial = 0;
   let detailExitTimer: number | undefined;
   let episodeClickTimer: number | undefined;
+  let shareStatusTimer: number | undefined;
+  let pendingSeekTime: number | undefined;
+  let lastPersistedSecond = -1;
+  let pageIsUnloading = false;
   let sheetPointerId: number | undefined;
   let sheetDragStartY = 0;
   let sheetDragStartedAt = 0;
@@ -255,7 +311,9 @@ export default function App() {
       : null;
     return episodes().filter((episode) => {
       const tags = episodeTags(episode);
-      const formatMatch = !formats.length || formats.some((format) => tags.includes(format));
+      const formatMatch = !formats.length || formats.some((format) =>
+        format === 'other' ? primaryFormat(episode) === 'Other' : tags.includes(format),
+      );
       const topicMatch = topics.every((topic) => tags.includes(topic));
       return (
         (numericQuery === null || episode.num === numericQuery) &&
@@ -297,7 +355,7 @@ export default function App() {
     setError('');
     const formats = selectedFormats();
     const topics = selectedTopics();
-    const baseTag = topics[0] ?? formats[0];
+    const baseTag = topics[0] ?? formats.find((format) => format !== 'other');
 
     try {
       const params = new URLSearchParams({
@@ -338,6 +396,71 @@ export default function App() {
     }
   };
 
+  const loadEpisodeByNumber = async (episodeNumber: number) => {
+    const availableEpisode = episodes().find((episode) => episode.num === episodeNumber);
+    if (availableEpisode) return availableEpisode;
+
+    const params = new URLSearchParams({
+      includeTagNames: 'true',
+      findWithPage: String(episodeNumber),
+      sort: 'date desc',
+      pageSize: String(PAGE_SIZE),
+    });
+    const apiResponse = await fetch(`${API_URL}?${params}`);
+    if (!apiResponse.ok) {
+      throw new Error(`The archive returned ${apiResponse.status}.`);
+    }
+
+    const response = await apiResponse.json() as PodcastResponse;
+    const episode = response.podcasts?.find((candidate) => candidate.num === episodeNumber);
+    if (!episode) throw new Error('This episode could not be found.');
+    return episode;
+  };
+
+  const storePlayback = (episode: Podcast, position: number, wasPlaying: boolean) => {
+    const safePosition = Number.isFinite(position) ? Math.max(0, position) : 0;
+    try {
+      localStorage.setItem(PLAYBACK_STORAGE_KEY, JSON.stringify({
+        version: 1,
+        episodeNumber: episode.num,
+        position: safePosition,
+        wasPlaying,
+      } satisfies StoredPlaybackState));
+      lastPersistedSecond = Math.floor(safePosition);
+    } catch {
+      // Playback must keep working even if browser storage is unavailable.
+    }
+  };
+
+  const persistCurrentPlayback = (force = false, wasPlaying = playing()) => {
+    const episode = currentEpisode();
+    if (!episode) return;
+    const position = pendingSeekTime ?? (
+      Number.isFinite(audioRef.currentTime) ? audioRef.currentTime : currentTime()
+    );
+    if (!force && Math.floor(position) === lastPersistedSecond) return;
+    storePlayback(episode, position, wasPlaying);
+  };
+
+  const navigateToEpisode = (episode: Podcast) => {
+    const nextPath = podcastPath(episode.num);
+    if (window.location.pathname === nextPath) return;
+    if (podcastNumberFromPath(window.location.pathname) !== undefined) {
+      window.history.replaceState(window.history.state, '', nextPath);
+      return;
+    }
+    window.history.pushState({ fdrPodcastOverlay: true }, '', nextPath);
+  };
+
+  const leaveEpisodeRoute = () => {
+    if (podcastNumberFromPath(window.location.pathname) === undefined) return;
+    if (window.history.state?.fdrPodcastOverlay) {
+      window.history.back();
+    } else {
+      window.history.replaceState(null, '', '/');
+    }
+  };
+
   createEffect(() => {
     const nextQuery = query().trim();
     const timer = window.setTimeout(() => setDebouncedQuery(nextQuery), 350);
@@ -355,9 +478,18 @@ export default function App() {
     ),
   );
 
+  createEffect(() => {
+    const episode = selectedEpisode();
+    document.title = episode
+      ? `Episode ${episode.num}: ${episode.title} | FDR Podcasts`
+      : DEFAULT_DOCUMENT_TITLE;
+  });
+
   const openDetails = (episode: Podcast) => {
     if (detailExitTimer) window.clearTimeout(detailExitTimer);
+    if (shareStatusTimer) window.clearTimeout(shareStatusTimer);
     setSpeedMenuOpen(false);
+    setShareStatus('idle');
     setDetailExitMode(null);
     setSheetDragY(0);
     setSheetDragging(false);
@@ -459,13 +591,36 @@ export default function App() {
         setSpeedMenuOpen(false);
       }
     };
+    const handlePopState = () => void handlePodcastLocation();
+    const handlePageExit = () => {
+      pageIsUnloading = true;
+      persistCurrentPlayback(true, playing());
+    };
+    const handlePageShow = () => {
+      pageIsUnloading = false;
+    };
     window.addEventListener('keydown', handleKeys);
     window.addEventListener('pointerdown', closeSpeedMenu);
+    window.addEventListener('popstate', handlePopState);
+    window.addEventListener('beforeunload', handlePageExit);
+    window.addEventListener('pagehide', handlePageExit);
+    window.addEventListener('pageshow', handlePageShow);
+    if (podcastNumberFromPath(window.location.pathname) !== undefined) {
+      void handlePodcastLocation();
+    } else {
+      void restoreStoredPlayback();
+    }
     onCleanup(() => {
       window.removeEventListener('keydown', handleKeys);
       window.removeEventListener('pointerdown', closeSpeedMenu);
+      window.removeEventListener('popstate', handlePopState);
+      window.removeEventListener('beforeunload', handlePageExit);
+      window.removeEventListener('pagehide', handlePageExit);
+      window.removeEventListener('pageshow', handlePageShow);
+      routeRequestSerial += 1;
       if (detailExitTimer) window.clearTimeout(detailExitTimer);
       if (episodeClickTimer) window.clearTimeout(episodeClickTimer);
+      if (shareStatusTimer) window.clearTimeout(shareStatusTimer);
     });
 
     void fetch('https://fdpodcasts.com/api/?method=ListPopularTags')
@@ -521,7 +676,13 @@ export default function App() {
     if (!episode.urls.audio) return;
     const isNew = currentEpisode()?.id !== episode.id;
     const keepDetailsOpen = selectedEpisode()?.id === episode.id;
+    const safeStartTime = Math.max(0, Math.min(episode.length || Infinity, startAt));
+    pendingSeekTime = isNew ? safeStartTime : undefined;
     setCurrentEpisode(episode);
+    setCurrentTime(safeStartTime);
+    setAudioDuration(episode.length || 0);
+    storePlayback(episode, safeStartTime, true);
+    navigateToEpisode(episode);
     if (keepDetailsOpen) {
       setDetailExitMode(null);
       setSheetDragY(0);
@@ -533,9 +694,137 @@ export default function App() {
       if (isNew) audioRef.load();
       audioRef.volume = volume();
       audioRef.playbackRate = playbackRate();
-      audioRef.currentTime = startAt;
-      void audioRef.play().catch(() => setPlaying(false));
+      try {
+        audioRef.currentTime = safeStartTime;
+      } catch {
+        pendingSeekTime = safeStartTime;
+      }
+      void audioRef.play().catch(() => {
+        setPlaying(false);
+        storePlayback(episode, safeStartTime, false);
+      });
     });
+  };
+
+  const loadPausedPlayback = (episode: Podcast, position: number) => {
+    const resumeAt = Math.max(0, Math.min(episode.length || Infinity, position));
+    pendingSeekTime = resumeAt;
+    setCurrentEpisode(episode);
+    setPlaying(false);
+    setCurrentTime(resumeAt);
+    setAudioDuration(episode.length || 0);
+    storePlayback(episode, resumeAt, false);
+
+    queueMicrotask(() => {
+      audioRef.load();
+      audioRef.volume = volume();
+      audioRef.playbackRate = playbackRate();
+      try {
+        audioRef.currentTime = resumeAt;
+      } catch {
+        pendingSeekTime = resumeAt;
+      }
+    });
+  };
+
+  const restoreStoredPlayback = async () => {
+    const storedPlayback = readStoredPlayback();
+    if (!storedPlayback) return;
+    const serial = ++routeRequestSerial;
+
+    try {
+      const episode = await loadEpisodeByNumber(storedPlayback.episodeNumber);
+      if (
+        serial !== routeRequestSerial ||
+        podcastNumberFromPath(window.location.pathname) !== undefined ||
+        currentEpisode()
+      ) return;
+
+      loadPausedPlayback(episode, storedPlayback.position);
+    } catch (caught) {
+      if (serial === routeRequestSerial) {
+        console.error('Could not restore the previous episode.', caught);
+      }
+    }
+  };
+
+  const handlePodcastLocation = async () => {
+    const episodeNumber = podcastNumberFromPath(window.location.pathname);
+    const serial = ++routeRequestSerial;
+
+    if (episodeNumber === undefined) {
+      if (selectedEpisode()) {
+        closeDetails(
+          currentEpisode()?.id === selectedEpisode()?.id ? 'sheet' : 'dismiss',
+        );
+      }
+      if (currentEpisode()) closePlayer();
+      return;
+    }
+
+    try {
+      const episode = await loadEpisodeByNumber(episodeNumber);
+      if (
+        serial !== routeRequestSerial ||
+        podcastNumberFromPath(window.location.pathname) !== episodeNumber
+      ) return;
+
+      const isAlreadyLoaded = currentEpisode()?.id === episode.id;
+      openDetails(episode);
+      if (!isAlreadyLoaded) {
+        const storedPlayback = readStoredPlayback();
+        const resumeAt = storedPlayback?.episodeNumber === episode.num
+          ? storedPlayback.position
+          : 0;
+        if (pageWasReloaded && storedPlayback?.episodeNumber === episode.num) {
+          loadPausedPlayback(episode, resumeAt);
+        } else {
+          beginPlayback(episode, resumeAt);
+        }
+      }
+      else if (audioRef.paused) void audioRef.play().catch(() => setPlaying(false));
+    } catch (caught) {
+      if (serial === routeRequestSerial) {
+        console.error('Could not open the shared episode.', caught);
+      }
+    }
+  };
+
+  const showShareStatus = (status: Exclude<ShareStatus, 'idle'>) => {
+    if (shareStatusTimer) window.clearTimeout(shareStatusTimer);
+    setShareStatus(status);
+    shareStatusTimer = window.setTimeout(() => {
+      setShareStatus('idle');
+      shareStatusTimer = undefined;
+    }, 2200);
+  };
+
+  const copyEpisodeLink = async (url: string) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(url);
+      return;
+    }
+
+    const input = document.createElement('textarea');
+    input.value = url;
+    input.setAttribute('readonly', '');
+    input.style.position = 'fixed';
+    input.style.opacity = '0';
+    document.body.append(input);
+    input.select();
+    const copied = document.execCommand('copy');
+    input.remove();
+    if (!copied) throw new Error('The episode link could not be copied.');
+  };
+
+  const shareEpisode = async (episode: Podcast) => {
+    const url = new URL(podcastPath(episode.num), window.location.origin).href;
+    try {
+      await copyEpisodeLink(url);
+      showShareStatus('copied');
+    } catch {
+      showShareStatus('failed');
+    }
   };
 
   const openEpisodeOnSingleClick = (episode: Podcast) => {
@@ -559,9 +848,18 @@ export default function App() {
   };
 
   const seekTo = (nextTime: number) => {
-    if (!currentEpisode()) return;
-    audioRef.currentTime = Math.max(0, Math.min(audioRef.duration || Infinity, nextTime));
-    setCurrentTime(audioRef.currentTime);
+    const episode = currentEpisode();
+    if (!episode) return;
+    const duration = audioRef.duration || audioDuration() || episode.length || Infinity;
+    const targetTime = Math.max(0, Math.min(duration, nextTime));
+    try {
+      audioRef.currentTime = targetTime;
+      pendingSeekTime = undefined;
+    } catch {
+      pendingSeekTime = targetTime;
+    }
+    setCurrentTime(targetTime);
+    storePlayback(episode, targetTime, playing());
   };
 
   const updateVolume = (nextVolume: number) => {
@@ -578,11 +876,19 @@ export default function App() {
 
   const closePlayer = () => {
     audioRef.pause();
+    leaveEpisodeRoute();
+    pendingSeekTime = undefined;
     setSpeedMenuOpen(false);
     setPlaying(false);
     setCurrentTime(0);
     setAudioDuration(0);
     setCurrentEpisode(undefined);
+    lastPersistedSecond = -1;
+    try {
+      localStorage.removeItem(PLAYBACK_STORAGE_KEY);
+    } catch {
+      // Nothing else to clean up when browser storage is unavailable.
+    }
     queueMicrotask(() => audioRef.load());
   };
 
@@ -600,11 +906,33 @@ export default function App() {
         ref={audioRef}
         src={currentEpisode()?.urls.audio}
         preload="metadata"
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        onEnded={() => setPlaying(false)}
-        onTimeUpdate={() => setCurrentTime(audioRef.currentTime)}
-        onLoadedMetadata={() => setAudioDuration(audioRef.duration)}
+        onPlay={() => {
+          setPlaying(true);
+          persistCurrentPlayback(true, true);
+          const episode = currentEpisode();
+          if (episode) navigateToEpisode(episode);
+        }}
+        onPause={() => {
+          setPlaying(false);
+          if (!pageIsUnloading) persistCurrentPlayback(true, false);
+        }}
+        onEnded={() => {
+          setPlaying(false);
+          persistCurrentPlayback(true, false);
+        }}
+        onTimeUpdate={() => {
+          setCurrentTime(audioRef.currentTime);
+          persistCurrentPlayback();
+        }}
+        onLoadedMetadata={() => {
+          setAudioDuration(audioRef.duration);
+          if (pendingSeekTime !== undefined) {
+            const resumeAt = Math.min(audioRef.duration || Infinity, pendingSeekTime);
+            pendingSeekTime = undefined;
+            audioRef.currentTime = resumeAt;
+            setCurrentTime(resumeAt);
+          }
+        }}
         onDurationChange={() => setAudioDuration(audioRef.duration)}
       />
 
@@ -694,7 +1022,9 @@ export default function App() {
                 onClick={() => setSelectedFormats(selectedFormats().includes(format.key) ? [] : [format.key])}
               >
                 <span>{format.label}</span>
-                <small>{compactNumber.format(format.count)}</small>
+                <Show when={'count' in format}>
+                  <small>{compactNumber.format('count' in format ? format.count : 0)}</small>
+                </Show>
               </button>
             )}</For>
           </div>
@@ -891,6 +1221,22 @@ export default function App() {
                   <div class="now-playing-copy">
                     <div class="now-playing-meta">
                       <span>{primaryFormat(episode)} · Episode #{episode.num}</span>
+                      <button
+                        class="now-playing-share"
+                        type="button"
+                        onClick={() => void shareEpisode(episode)}
+                          aria-label={`Copy link for ${episode.title}`}
+                        aria-live="polite"
+                      >
+                        <Share2 size={14} />
+                        <span>
+                          {shareStatus() === 'copied'
+                            ? 'Link copied'
+                            : shareStatus() === 'failed'
+                              ? 'Copy failed'
+                                : 'Copy link'}
+                        </span>
+                      </button>
                     </div>
                     <h2>{episode.title}</h2>
                   </div>
@@ -961,12 +1307,30 @@ export default function App() {
                   <span>{formatDuration(episode.length)}</span>
                 </span>
                 <h2>{episode.title}</h2>
-                <button class="primary-play" type="button" onClick={() => beginPlayback(episode)} disabled={!episode.urls.audio}>
-                  <Show when={currentEpisode()?.id === episode.id && playing()} fallback={<Play size={18} fill="currentColor" />}>
-                    <Pause size={18} fill="currentColor" />
-                  </Show>
-                  {currentEpisode()?.id === episode.id && playing() ? 'Playing now' : 'Play episode'}
-                </button>
+                <div class="detail-actions">
+                  <button class="primary-play" type="button" onClick={() => beginPlayback(episode)} disabled={!episode.urls.audio}>
+                    <Show when={currentEpisode()?.id === episode.id && playing()} fallback={<Play size={18} fill="currentColor" />}>
+                      <Pause size={18} fill="currentColor" />
+                    </Show>
+                    {currentEpisode()?.id === episode.id && playing() ? 'Playing now' : 'Play episode'}
+                  </button>
+                  <button
+                    class="share-button"
+                    type="button"
+                    onClick={() => void shareEpisode(episode)}
+                    aria-label={`Copy link for ${episode.title}`}
+                    aria-live="polite"
+                  >
+                    <Share2 size={16} />
+                    <span>
+                      {shareStatus() === 'copied'
+                        ? 'Link copied'
+                        : shareStatus() === 'failed'
+                          ? 'Copy failed'
+                          : 'Copy link'}
+                    </span>
+                  </button>
+                </div>
               </div>
             </div>
 
